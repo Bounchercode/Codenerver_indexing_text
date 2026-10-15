@@ -7,7 +7,7 @@ import assert from 'assert';
 import { MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
-import { ChatFindModel } from '../../../browser/widget/chatFind/chatFindModel.js';
+import { ChatFindModel, type IChatFindRegexScanner } from '../../../browser/widget/chatFind/chatFindModel.js';
 import { ChatTreeItem } from '../../../browser/chat.js';
 
 /** Builds a minimal fake request item satisfying `isRequestVM` (`'message' in item`). */
@@ -356,6 +356,57 @@ suite('ChatFindModel', () => {
 		model.setQuery('([', { isRegex: true, matchCase: false, wholeWord: false });
 		assert.strictEqual(model.isInvalidRegex, true);
 		assert.strictEqual(model.matches.length, 0);
+		model.dispose();
+	});
+
+	test('publishes worker regex matches after the asynchronous scan', async () => {
+		const scanner: IChatFindRegexScanner = {
+			reset: () => { },
+			scan: async () => [{ occurrenceIndex: 0, start: 0, end: 3, text: 'foo' }]
+		};
+		const model = new ChatFindModel(() => [fakeRequest('req1', 'foo')], () => undefined, scanner);
+		await model.setQuery('foo', { isRegex: true, matchCase: false, wholeWord: false });
+		assert.deepStrictEqual(model.matches.map(match => ({ itemId: match.itemId, text: match.text })), [{ itemId: 'req1', text: 'foo' }]);
+		model.dispose();
+	});
+
+	test('ignores a stale worker result after the query changes', async () => {
+		let resolveFirst!: (matches: readonly { occurrenceIndex: number; start: number; end: number; text: string }[]) => void;
+		const scanner: IChatFindRegexScanner = {
+			reset: () => { },
+			scan: (_text, regex) => regex.source === 'old'
+				? new Promise(resolve => { resolveFirst = resolve; })
+				: Promise.resolve([{ occurrenceIndex: 0, start: 4, end: 7, text: 'new' }])
+		};
+		const model = new ChatFindModel(() => [fakeRequest('req1', 'old new')], () => undefined, scanner);
+		const first = model.setQuery('old', { isRegex: true, matchCase: false, wholeWord: false });
+		await model.setQuery('new', { isRegex: true, matchCase: false, wholeWord: false });
+		resolveFirst([{ occurrenceIndex: 0, start: 0, end: 3, text: 'old' }]);
+		await first;
+		assert.deepStrictEqual(model.matches.map(match => match.text), ['new']);
+		model.dispose();
+	});
+
+	test('cancels a pending worker result when Find is hidden', async () => {
+		let resolveScan!: (matches: readonly { occurrenceIndex: number; start: number; end: number; text: string }[]) => void;
+		const scanner: IChatFindRegexScanner = {
+			reset: () => { },
+			scan: () => new Promise(resolve => { resolveScan = resolve; })
+		};
+		const model = new ChatFindModel(() => [fakeRequest('req1', 'foo')], () => undefined, scanner);
+		const search = model.setQuery('foo', { isRegex: true, matchCase: false, wholeWord: false });
+		model.cancelPendingSearch();
+		resolveScan([{ occurrenceIndex: 0, start: 0, end: 3, text: 'foo' }]);
+		await search;
+		assert.deepStrictEqual({ query: model.query, matches: model.matches.length }, { query: 'foo', matches: 0 });
+		model.dispose();
+	});
+
+	test('reports a worker timeout without publishing incomplete matches', async () => {
+		const scanner: IChatFindRegexScanner = { reset: () => { }, scan: async () => undefined };
+		const model = new ChatFindModel(() => [fakeRequest('req1', 'aaa!')], () => undefined, scanner);
+		await model.setQuery('^(a+)+$', { isRegex: true, matchCase: false, wholeWord: false });
+		assert.deepStrictEqual({ timedOut: model.isSearchTimedOut, matches: model.matches.length }, { timedOut: true, matches: 0 });
 		model.dispose();
 	});
 

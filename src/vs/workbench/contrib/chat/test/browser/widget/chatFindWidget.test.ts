@@ -9,6 +9,8 @@ import { Event as BaseEvent } from '../../../../../../base/common/event.js';
 import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
 import { createRegExp } from '../../../../../../base/common/strings.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+import { IWebWorkerService } from '../../../../../../platform/webWorker/browser/webWorkerService.js';
+import { WebWorkerService } from '../../../../../../platform/webWorker/browser/webWorkerServiceImpl.js';
 import { workbenchInstantiationService } from '../../../../../test/browser/workbenchTestServices.js';
 import { ChatTreeItem } from '../../../browser/chat.js';
 import { ChatFindModel } from '../../../browser/widget/chatFind/chatFindModel.js';
@@ -20,6 +22,7 @@ suite('ChatFindWidget', () => {
 	function createWidget(items: readonly ChatTreeItem[] = []) {
 		const disposables = store.add(new DisposableStore());
 		const instantiationService = workbenchInstantiationService(undefined, disposables);
+		instantiationService.stub(IWebWorkerService, new WebWorkerService());
 		const container = document.createElement('div');
 		const transcriptDomNode = container.appendChild(document.createElement('div'));
 		const host: IChatFindHost = {
@@ -398,11 +401,12 @@ suite('ChatFindWidget settled result count', () => {
 
 	interface ISettleHarness {
 		_pendingSearch: Promise<void> | undefined;
+		_model: { pendingSearch: Promise<void> | undefined };
 		_settleBarrier: DeferredPromise<void> | undefined;
 	}
 
 	test('waits for an in-flight match location before reporting', async () => {
-		const harness: ISettleHarness = { _pendingSearch: undefined, _settleBarrier: undefined };
+		const harness: ISettleHarness = { _pendingSearch: undefined, _model: { pendingSearch: undefined }, _settleBarrier: undefined };
 		beginSettle.call(harness);
 
 		let settled = false;
@@ -418,7 +422,7 @@ suite('ChatFindWidget settled result count', () => {
 
 	test('waits for a debounced search that has not run yet', async () => {
 		const search = new DeferredPromise<void>();
-		const harness: ISettleHarness = { _pendingSearch: search.p, _settleBarrier: undefined };
+		const harness: ISettleHarness = { _pendingSearch: search.p, _model: { pendingSearch: undefined }, _settleBarrier: undefined };
 
 		let settled = false;
 		const waiting = whenSettled.call(harness).then(() => { settled = true; });
@@ -432,10 +436,23 @@ suite('ChatFindWidget settled result count', () => {
 		assert.strictEqual(settled, true);
 	});
 
+	test('waits for a regex worker scan before reporting', async () => {
+		const scan = new DeferredPromise<void>();
+		const harness: ISettleHarness = { _pendingSearch: undefined, _model: { pendingSearch: scan.p }, _settleBarrier: undefined };
+		let settled = false;
+		const waiting = whenSettled.call(harness).then(() => { settled = true; });
+		await Promise.resolve();
+		assert.strictEqual(settled, false);
+		harness._model.pendingSearch = undefined;
+		await scan.complete();
+		await waiting;
+		assert.strictEqual(settled, true);
+	});
+
 	test('keeps waiting when a newer keystroke supersedes the search it was waiting on', async () => {
 		const first = new DeferredPromise<void>();
 		const second = new DeferredPromise<void>();
-		const harness: ISettleHarness = { _pendingSearch: first.p, _settleBarrier: undefined };
+		const harness: ISettleHarness = { _pendingSearch: first.p, _model: { pendingSearch: undefined }, _settleBarrier: undefined };
 
 		let settled = false;
 		const waiting = whenSettled.call(harness).then(() => { settled = true; });
@@ -453,13 +470,13 @@ suite('ChatFindWidget settled result count', () => {
 	});
 
 	test('returns immediately when nothing is in flight', async () => {
-		const harness: ISettleHarness = { _pendingSearch: undefined, _settleBarrier: undefined };
+		const harness: ISettleHarness = { _pendingSearch: undefined, _model: { pendingSearch: undefined }, _settleBarrier: undefined };
 
 		await whenSettled.call(harness);
 	});
 
 	test('completing twice is safe, so cleanup paths cannot strand a waiter', async () => {
-		const harness: ISettleHarness = { _pendingSearch: undefined, _settleBarrier: undefined };
+		const harness: ISettleHarness = { _pendingSearch: undefined, _model: { pendingSearch: undefined }, _settleBarrier: undefined };
 		beginSettle.call(harness);
 		const waiting = whenSettled.call(harness);
 

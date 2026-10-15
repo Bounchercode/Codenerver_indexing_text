@@ -86,6 +86,7 @@ const workerEntryPoints = [
 	'vs/editor/common/services/editorWebWorkerMain',
 	'vs/workbench/api/worker/extensionHostWorkerMain',
 	'vs/workbench/contrib/notebook/common/services/notebookWebWorkerMain',
+	'vs/workbench/contrib/chat/browser/widget/chatFind/chatFindRegexWorkerMain',
 	'vs/workbench/services/languageDetection/browser/languageDetectionWebWorkerMain',
 	'vs/workbench/services/search/worker/localFileSearchMain',
 	'vs/workbench/contrib/output/common/outputLinkComputerMain',
