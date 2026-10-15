@@ -12,14 +12,20 @@ import { isRequestVM, isResponseVM } from '../../../common/model/chatViewModel.j
 import { annotateSpecialMarkdownContentWithSource } from '../../../common/widget/annotations.js';
 import { moveResponseOutcomeToolsAfterFinalResponse } from '../chatListRenderer.js';
 import { getChatRequestText } from '../../chatRequestText.js';
+import type { IChatFindRegexMatch } from './chatFindRegexWorker.js';
 
-/** Upper bound on tracked matches, mirroring `LIMIT_FIND_COUNT` in `textModelSearch.ts`, so a pathological regex can't pin the UI. */
+/** Upper bound on tracked matches, mirroring `LIMIT_FIND_COUNT` in `textModelSearch.ts`. */
 export const MAX_FIND_MATCHES = 9999;
 
 export interface IChatFindOptions {
 	readonly isRegex: boolean;
 	readonly matchCase: boolean;
 	readonly wholeWord: boolean;
+}
+
+export interface IChatFindRegexScanner {
+	scan(text: string, regex: RegExp, resultLimit: number, scanLimit: number): Promise<readonly IChatFindRegexMatch[] | undefined>;
+	reset(): void;
 }
 
 export type ChatFindItemKind = 'request' | 'response';
@@ -115,8 +121,8 @@ function buildSegments(items: readonly ChatTreeItem[]): IChatFindSegment[] {
 
 /**
  * Bounds a single segment's scan. Higher than {@link MAX_FIND_MATCHES} because a segment has to be
- * scanned past the cap to know which of its occurrences are the newest, but still finite so a
- * pathological regex over a huge response cannot pin the UI.
+ * scanned past the cap to know which of its occurrences are the newest. The regex worker also
+ * has a wall-clock timeout for expressions whose individual `exec` call takes too long.
  */
 const MAX_SEGMENT_SCAN = 100_000;
 
@@ -167,10 +173,14 @@ export class ChatFindModel extends Disposable {
 	private _activeIndex = -1;
 	private _activeAnchor: IChatFindAnchor | undefined;
 	private _invalidRegex = false;
+	private _searchTimedOut = false;
+	private _revision = 0;
+	private _pendingSearch: Promise<void> | undefined;
 
 	constructor(
 		private readonly getItems: () => readonly ChatTreeItem[],
-		private readonly getViewportAnchorItemId: () => string | undefined = () => undefined
+		private readonly getViewportAnchorItemId: () => string | undefined = () => undefined,
+		private readonly regexScanner?: IChatFindRegexScanner
 	) {
 		super();
 	}
@@ -188,6 +198,14 @@ export class ChatFindModel extends Disposable {
 		return this._invalidRegex;
 	}
 
+	get isSearchTimedOut(): boolean {
+		return this._searchTimedOut;
+	}
+
+	get pendingSearch(): Promise<void> | undefined {
+		return this._pendingSearch;
+	}
+
 	get matches(): readonly IChatFindMatch[] {
 		return this._matches;
 	}
@@ -200,7 +218,7 @@ export class ChatFindModel extends Disposable {
 		return this._activeIndex >= 0 ? this._matches[this._activeIndex] : undefined;
 	}
 
-	setQuery(query: string, options: IChatFindOptions): void {
+	setQuery(query: string, options: IChatFindOptions): Promise<void> | void {
 		const changed = query !== this._query
 			|| options.isRegex !== this._options.isRegex
 			|| options.matchCase !== this._options.matchCase
@@ -211,11 +229,15 @@ export class ChatFindModel extends Disposable {
 			this._activeAnchor = undefined;
 			this._activeIndex = -1;
 		}
-		this.recompute();
+		return this.recompute();
 	}
 
 	/** Rebuilds matches from the current transcript, preserving the active match's anchor when it still exists. */
-	recompute(): void {
+	recompute(): Promise<void> | void {
+		const revision = ++this._revision;
+		this.regexScanner?.reset();
+		this._pendingSearch = undefined;
+		this._searchTimedOut = false;
 		const previousAnchor = this._activeAnchor;
 
 		if (!this._query) {
@@ -246,6 +268,18 @@ export class ChatFindModel extends Disposable {
 
 		const items = this.getItems();
 		const segments = buildSegments(items);
+		if (this._options.isRegex && this.regexScanner) {
+			this._matches = [];
+			this._activeIndex = -1;
+			const pending = this._recomputeRegex(segments, items, regex, previousAnchor, revision);
+			this._pendingSearch = pending;
+			void pending.finally(() => {
+				if (this._pendingSearch === pending) {
+					this._pendingSearch = undefined;
+				}
+			});
+			return pending;
+		}
 		const matches: IChatFindMatch[] = [];
 		// Newest first: `buildSegments` produces transcript order, so both walks are reversed.
 		for (let index = segments.length - 1; index >= 0 && matches.length < MAX_FIND_MATCHES; index--) {
@@ -255,8 +289,41 @@ export class ChatFindModel extends Disposable {
 			}
 		}
 
-		this._matches = matches;
+		this._publishMatches(matches, items, previousAnchor);
+	}
 
+	private async _recomputeRegex(segments: readonly IChatFindSegment[], items: readonly ChatTreeItem[], regex: RegExp, previousAnchor: IChatFindAnchor | undefined, revision: number): Promise<void> {
+		const matches: IChatFindMatch[] = [];
+		for (let index = segments.length - 1; index >= 0 && matches.length < MAX_FIND_MATCHES; index--) {
+			const segment = segments[index];
+			const found = await this.regexScanner!.scan(segment.text, regex, MAX_FIND_MATCHES - matches.length, MAX_SEGMENT_SCAN);
+			if (revision !== this._revision) {
+				return;
+			}
+			if (!found) {
+				this._searchTimedOut = true;
+				this._publishMatches([], items, undefined);
+				return;
+			}
+			for (let occurrence = found.length - 1; occurrence >= 0; occurrence--) {
+				const match = found[occurrence];
+				matches.push({
+					itemId: segment.itemId,
+					itemKind: segment.itemKind,
+					partIndex: segment.partIndex,
+					scopeStartPartIndex: segment.scopeStartPartIndex,
+					occurrenceIndex: match.occurrenceIndex,
+					start: match.start,
+					end: match.end,
+					text: match.text
+				});
+			}
+		}
+		this._publishMatches(matches, items, previousAnchor);
+	}
+
+	private _publishMatches(matches: IChatFindMatch[], items: readonly ChatTreeItem[], previousAnchor: IChatFindAnchor | undefined): void {
+		this._matches = matches;
 		if (previousAnchor) {
 			this._activeIndex = matches.findIndex(m => m.itemId === previousAnchor.itemId && m.partIndex === previousAnchor.partIndex && m.occurrenceIndex === previousAnchor.occurrenceIndex);
 		}
@@ -264,7 +331,6 @@ export class ChatFindModel extends Disposable {
 			this._activeIndex = this._seedActiveIndex(matches, items);
 		}
 		this._updateAnchor();
-
 		this._onDidChangeMatches.fire();
 	}
 
@@ -291,11 +357,24 @@ export class ChatFindModel extends Disposable {
 	}
 
 	clear(): void {
+		this.cancelPendingSearch();
+		this._searchTimedOut = false;
 		this._query = '';
 		this._matches = [];
 		this._activeIndex = -1;
 		this._activeAnchor = undefined;
 		this._invalidRegex = false;
+	}
+
+	cancelPendingSearch(): void {
+		this._revision++;
+		this.regexScanner?.reset();
+		this._pendingSearch = undefined;
+	}
+
+	override dispose(): void {
+		this.cancelPendingSearch();
+		super.dispose();
 	}
 
 	private _updateAnchor(): void {

@@ -9,16 +9,19 @@ import { DeferredPromise, Delayer } from '../../../../../../base/common/async.js
 import { createRegExp } from '../../../../../../base/common/strings.js';
 import { isDefined } from '../../../../../../base/common/types.js';
 import { Event } from '../../../../../../base/common/event.js';
+import * as nls from '../../../../../../nls.js';
 import { MutableDisposable } from '../../../../../../base/common/lifecycle.js';
 import { Range as EditorRange } from '../../../../../../editor/common/core/range.js';
 import { EditorOption } from '../../../../../../editor/common/config/editorOptions.js';
 import { IEditorDecorationsCollection } from '../../../../../../editor/common/editorCommon.js';
+import { IWebWorkerService } from '../../../../../../platform/webWorker/browser/webWorkerService.js';
 import { IAccessibilityService } from '../../../../../../platform/accessibility/common/accessibility.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { IContextKey, IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
 import { IContextViewService } from '../../../../../../platform/contextview/browser/contextView.js';
 import { IHoverService } from '../../../../../../platform/hover/browser/hover.js';
 import { IKeybindingService } from '../../../../../../platform/keybinding/common/keybinding.js';
+import { INotificationService } from '../../../../../../platform/notification/common/notification.js';
 import { SimpleFindWidget } from '../../../../codeEditor/browser/find/simpleFindWidget.js';
 import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
 import { ChatTreeItem, IChatFindController } from '../../chat.js';
@@ -27,6 +30,7 @@ import { CodeBlockPart } from '../chatContentParts/codeBlockPart.js';
 import { ChatFindCommandId } from './chatFindCommandIds.js';
 import { getChatFindHighlightRegistry, supportsCssHighlightApi } from './chatFindHighlights.js';
 import { ChatFindModel, IChatFindMatch, MAX_FIND_MATCHES } from './chatFindModel.js';
+import { ChatFindRegexScanner } from './chatFindRegexScanner.js';
 
 export interface IChatFindHost {
 	readonly transcriptDomNode: HTMLElement;
@@ -80,7 +84,7 @@ function nearestBlock(node: Node, root: HTMLElement): Element {
 	return element ?? root;
 }
 
-export function findMatchRangesInDom(root: HTMLElement, regex: RegExp, limit: number, excludedRoots: readonly HTMLElement[] = []): Range[] {
+function collectDomText(root: HTMLElement, excludedRoots: readonly HTMLElement[]): { buffer: string; nodes: { node: Text; start: number; end: number }[] } {
 	const ownerDocument = root.ownerDocument;
 	const nodes: { node: Text; start: number; end: number }[] = [];
 	let buffer = '';
@@ -111,9 +115,15 @@ export function findMatchRangesInDom(root: HTMLElement, regex: RegExp, limit: nu
 		buffer += text;
 	}
 
+	return { buffer, nodes };
+}
+
+export function findMatchRangesInDom(root: HTMLElement, regex: RegExp, limit: number, excludedRoots: readonly HTMLElement[] = []): Range[] {
+	const { buffer, nodes } = collectDomText(root, excludedRoots);
 	if (!buffer) {
 		return [];
 	}
+	const ownerDocument = root.ownerDocument;
 
 	const ranges: Range[] = [];
 	regex.lastIndex = 0;
@@ -131,6 +141,27 @@ export function findMatchRangesInDom(root: HTMLElement, regex: RegExp, limit: nu
 		}
 	}
 	return ranges;
+}
+
+async function findMatchRangesInDomWithScanner(root: HTMLElement, regex: RegExp, limit: number, scanner: ChatFindRegexScanner, excludedRoots: readonly HTMLElement[] = []): Promise<Range[]> {
+	const { buffer, nodes } = collectDomText(root, excludedRoots);
+	if (!buffer) {
+		return [];
+	}
+	let scanLimit = Math.min(100_000, Math.max(limit, 1));
+	while (true) {
+		const matches = await scanner.scan(buffer, regex, scanLimit, scanLimit);
+		if (!matches) {
+			return [];
+		}
+		const ranges = matches.map(match => toDomRange(root.ownerDocument, nodes, match.start, match.end)).filter(isDefined);
+		if (ranges.length >= limit || matches.length < scanLimit || scanLimit === 100_000) {
+			return ranges.slice(0, limit);
+		}
+		// A match on a synthetic block separator has no DOM range. Look past it so
+		// later visible matches retain the same occurrence order as the old scanner.
+		scanLimit = Math.min(100_000, scanLimit * 2);
+	}
 }
 
 function toDomRange(ownerDocument: Document, nodes: { node: Text; start: number; end: number }[], start: number, end: number): Range | undefined {
@@ -230,10 +261,23 @@ export function findMatchRangesInCodeBlock(codeBlock: CodeBlockPart, regex: RegE
 	return ranges;
 }
 
+async function findMatchRangesInCodeBlockWithScanner(codeBlock: CodeBlockPart, regex: RegExp, limit: number, scanner: ChatFindRegexScanner): Promise<EditorRange[]> {
+	const model = codeBlock.editor.getModel();
+	if (!model) {
+		return [];
+	}
+	const matches = await scanner.scan(model.getValue(), regex, limit, limit);
+	return matches?.map(match => EditorRange.fromPositions(model.getPositionAt(match.start), model.getPositionAt(match.end))) ?? [];
+}
+
 /** Finds text across a chat widget's logical transcript. */
 export class ChatFindWidget extends SimpleFindWidget implements IChatFindController {
 
 	private readonly _model: ChatFindModel;
+	private readonly _regexScanner: ChatFindRegexScanner;
+	private _queryGeneration = 0;
+	private _paintGeneration = 0;
+	private _warnedRegexTimeout = false;
 
 	private readonly _findWidgetVisibleKey: IContextKey<boolean>;
 	private readonly _findWidgetFocusedKey: IContextKey<boolean>;
@@ -272,6 +316,8 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		@IKeybindingService keybindingService: IKeybindingService,
 		@IConfigurationService configurationService: IConfigurationService,
 		@IAccessibilityService accessibilityService: IAccessibilityService,
+		@IWebWorkerService webWorkerService: IWebWorkerService,
+		@INotificationService private readonly notificationService: INotificationService,
 	) {
 		super({
 			showCommonFindToggles: true,
@@ -294,13 +340,15 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		this._findWidgetFocusedKey = ChatContextKeys.findWidgetFocused.bindTo(contextKeyService);
 		this._findInputFocusedKey = ChatContextKeys.findInputFocused.bindTo(contextKeyService);
 
-		this._model = this._register(new ChatFindModel(() => this.host.getItems(), () => this.host.getViewportAnchorItemId()));
+		this._regexScanner = this._register(new ChatFindRegexScanner(webWorkerService));
+		this._model = this._register(new ChatFindModel(() => this.host.getItems(), () => this.host.getViewportAnchorItemId(), this._regexScanner));
 		this._register(this._model.onDidChangeMatches(() => this._onMatchesChanged()));
 
 		this._register(this.host.onDidChangeContent(() => {
 			if (this.isVisible()) {
-				this._recomputeDelayer.trigger(() => {
-					this._model.recompute();
+				this._paintGeneration++;
+				this._recomputeDelayer.trigger(async () => {
+					await this._model.recompute();
 					// The row usually rerenders before this debounced pass, against the old matches.
 					this._scheduleRepaint();
 				}).catch(() => { });
@@ -331,8 +379,9 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		} else {
 			super.show(seedText);
 		}
-		this._model.setQuery(this.inputValue, this._currentFindOptions());
-		this._navigateToActive();
+		this._searchDelayer.cancel();
+		this._pendingSearch = undefined;
+		void this._setQueryAndNavigate();
 	}
 
 	override hide(): void {
@@ -341,6 +390,9 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		this._recomputeDelayer.cancel();
 		this._searchDelayer.cancel();
 		this._pendingSearch = undefined;
+		this._queryGeneration++;
+		this._paintGeneration++;
+		this._model.cancelPendingSearch();
 		this._completeSettle();
 		this._revealScheduler.clear();
 		this._repaintScheduler.clear();
@@ -353,8 +405,10 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		this._unlocatableSkips = 0;
 		if (this._flushPendingSearch()) {
 			// The query was not searched yet, so Enter lands on its first match, not its second.
-			this._navigateToActive();
 			void this.updateResultCount();
+			return;
+		}
+		if (this._model.pendingSearch) {
 			return;
 		}
 		this._advanceActiveMatch(previous);
@@ -370,8 +424,11 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		}
 		this._searchDelayer.cancel();
 		this._pendingSearch = undefined;
-		this._model.setQuery(this.inputValue, this._currentFindOptions());
-		return true;
+		if (this._isModelStale()) {
+			void this._setQueryAndNavigate();
+			return true;
+		}
+		return !!this._model.pendingSearch;
 	}
 
 	private _advanceActiveMatch(previous: boolean): void {
@@ -404,8 +461,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		// Toggling an option supersedes a keystroke still waiting out the debounce.
 		this._searchDelayer.cancel();
 		this._pendingSearch = undefined;
-		this._model.setQuery(this.inputValue, this._currentFindOptions());
-		this._navigateToActive();
+		void this._setQueryAndNavigate();
 	}
 
 	next(): void {
@@ -465,10 +521,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		if (!this._isModelStale()) {
 			return;
 		}
-		const search = this._searchDelayer.trigger(() => {
-			this._model.setQuery(this.inputValue, this._currentFindOptions());
-			this._navigateToActive();
-		});
+		const search = this._searchDelayer.trigger(() => this._isModelStale() ? this._setQueryAndNavigate() : Promise.resolve());
 		this._pendingSearch = search;
 		search.catch(() => { }).finally(() => {
 			if (this._pendingSearch === search) {
@@ -498,7 +551,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		// `FindInput.onDidChange` reads the count before `onInput` schedules the search.
 		await Promise.resolve();
 		for (let attempt = 0; attempt < MAX_SETTLE_WAITS; attempt++) {
-			const pending = [this._pendingSearch, this._settleBarrier?.p].filter(isDefined);
+			const pending = [this._pendingSearch, this._model.pendingSearch, this._settleBarrier?.p].filter(isDefined);
 			if (!pending.length) {
 				return;
 			}
@@ -509,7 +562,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 
 	protected async _getResultCount(): Promise<{ resultIndex: number; resultCount: number } | undefined> {
 		await this._whenSettled();
-		if (this._model.isInvalidRegex) {
+		if (this._model.isInvalidRegex || this._model.isSearchTimedOut) {
 			return undefined;
 		}
 		return { resultIndex: this._model.activeIndex, resultCount: this._model.matches.length };
@@ -539,6 +592,41 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		void this.updateResultCount();
 	}
 
+	private _setQueryAndNavigate(): Promise<void> {
+		const generation = ++this._queryGeneration;
+		this._paintGeneration++;
+		this._warnedRegexTimeout = false;
+		const search = this._model.setQuery(this.inputValue, this._currentFindOptions());
+		if (!search) {
+			this._navigateToActive();
+			return Promise.resolve();
+		}
+		return search.then(async () => {
+			// Streaming can supersede this scan with a recompute of the same query.
+			// Navigate only after that newer scan has produced its matches.
+			for (let attempt = 0; attempt < MAX_SETTLE_WAITS; attempt++) {
+				const pending = this._model.pendingSearch;
+				if (!pending || pending === search || generation !== this._queryGeneration) {
+					break;
+				}
+				await pending;
+			}
+			if (generation === this._queryGeneration && this.isVisible()) {
+				if (this._model.isSearchTimedOut) {
+					this._warnRegexTimeout();
+				}
+				this._navigateToActive();
+			}
+		});
+	}
+
+	private _warnRegexTimeout(): void {
+		if (!this._warnedRegexTimeout) {
+			this._warnedRegexTimeout = true;
+			this.notificationService.warn(nls.localize('chatFind.regexTimedOut', "Chat regular-expression search could not finish. Try again or use a simpler expression."));
+		}
+	}
+
 	private _navigateToActive(): void {
 		const match = this._model.activeMatch;
 		this._clearHighlights();
@@ -554,29 +642,37 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 			this.host.reveal(item);
 		}
 
-		this._revealScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => this._revealActiveMatch(match));
+		this._revealScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => { void this._revealActiveMatch(match); });
 	}
 
-	private _revealActiveMatch(match: IChatFindMatch, attempt: number = 0): void {
-		const locatedMatch = this._locateMatch(match);
+	private async _revealActiveMatch(match: IChatFindMatch, attempt: number = 0): Promise<void> {
+		const locatedMatch = await this._locateMatch(match, undefined, () => this._model.activeMatch === match && this.isVisible());
+		if (this._model.activeMatch !== match || !this.isVisible()) {
+			return;
+		}
 		if (!locatedMatch) {
+			if (this._regexScanner.failed) {
+				this._warnRegexTimeout();
+				this._completeSettle();
+				return;
+			}
 			// A long jump outruns the list, which mounts and re-measures rows over later frames.
 			if (attempt < ChatFindWidget.MAX_LOCATE_ATTEMPTS) {
 				const item = this._findItemForMatch(match);
 				if (item) {
 					this.host.reveal(item);
 				}
-				this._revealScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => this._revealActiveMatch(match, attempt + 1));
+				this._revealScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => { void this._revealActiveMatch(match, attempt + 1); });
 				return;
 			}
-			this._repaintVisibleHighlights();
+			void this._repaintVisibleHighlights();
 			this._skipUnlocatableMatch();
 			return;
 		}
 		if (isCodeMatch(locatedMatch)) {
 			const revealCodeMatch = () => {
 				locatedMatch.codeBlock.editor.revealRangeInCenter(locatedMatch.range);
-				this._repaintVisibleHighlights();
+				void this._repaintVisibleHighlights();
 				this._revealRect(this._codeMatchRect(locatedMatch));
 				this._completeSettle();
 			};
@@ -590,7 +686,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 
 		const range = locatedMatch;
 		const opened = this._openAncestorDisclosures(range);
-		this._repaintVisibleHighlights();
+		void this._repaintVisibleHighlights();
 		if (opened) {
 			this._revealScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => {
 				this._revealRect(this._rangeRect(range));
@@ -674,7 +770,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 	}
 
 	private _scheduleRepaint(): void {
-		this._repaintScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => this._repaintVisibleHighlights());
+		this._repaintScheduler.value = dom.scheduleAtNextAnimationFrame(this._targetWindow, () => { void this._repaintVisibleHighlights(); });
 	}
 
 	private _tryCreateRegex(): RegExp | undefined {
@@ -711,7 +807,10 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 	}
 
 	/** Locates the active match's DOM range within its rendered content part (or the whole row as a fallback). */
-	private _locateMatch(match: IChatFindMatch, regex?: RegExp): LocatedMatch | undefined {
+	private async _locateMatch(match: IChatFindMatch, regex?: RegExp, isCurrent?: () => boolean): Promise<LocatedMatch | undefined> {
+		if (this._model.options.isRegex && this._regexScanner.failed) {
+			return undefined;
+		}
 		const template = this.host.getTemplateDataForRequestId(match.itemId);
 		const roots = this._locateMatchRoots(match, template);
 		if (!roots.length) {
@@ -728,15 +827,21 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 				.filter(codeBlock => root.contains(codeBlock.element))
 				.sort((first, second) => first.element.compareDocumentPosition(second.element) & 4 ? -1 : 1);
 
-			findMatchRangesInDom(
-				root,
-				effectiveRegex,
-				match.occurrenceIndex + 1,
-				codeBlocks.map(codeBlock => codeBlock.element)
-			).forEach((range, order) => locations.push({ node: range.startContainer, order, match: range }));
+			const domRanges = this._model.options.isRegex
+				? await findMatchRangesInDomWithScanner(root, effectiveRegex, match.occurrenceIndex + 1, this._regexScanner, codeBlocks.map(codeBlock => codeBlock.element))
+				: findMatchRangesInDom(root, effectiveRegex, match.occurrenceIndex + 1, codeBlocks.map(codeBlock => codeBlock.element));
+			if (this.host.getTemplateDataForRequestId(match.itemId) !== template || (isCurrent && !isCurrent())) {
+				return undefined;
+			}
+			domRanges.forEach((range, order) => locations.push({ node: range.startContainer, order, match: range }));
 
 			for (const codeBlock of codeBlocks) {
-				const ranges = findMatchRangesInCodeBlock(codeBlock, effectiveRegex, match.occurrenceIndex + 1);
+				const ranges = this._model.options.isRegex
+					? await findMatchRangesInCodeBlockWithScanner(codeBlock, effectiveRegex, match.occurrenceIndex + 1, this._regexScanner)
+					: findMatchRangesInCodeBlock(codeBlock, effectiveRegex, match.occurrenceIndex + 1);
+				if (this.host.getTemplateDataForRequestId(match.itemId) !== template || (isCurrent && !isCurrent())) {
+					return undefined;
+				}
 				for (let order = 0; order < ranges.length; order++) {
 					locations.push({
 						node: codeBlock.element,
@@ -752,7 +857,8 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 		return locations[match.occurrenceIndex]?.match;
 	}
 
-	private _repaintVisibleHighlights(): void {
+	private async _repaintVisibleHighlights(): Promise<void> {
+		const generation = ++this._paintGeneration;
 		const registry = getChatFindHighlightRegistry(this._targetWindow);
 
 		if (!this.isVisible() || !this._model.matches.length || !this._model.query) {
@@ -787,7 +893,16 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 			if (!isRendered) {
 				continue;
 			}
-			const locatedMatch = this._locateMatch(match, regex);
+			const locatedMatch = await this._locateMatch(match, regex, () => generation === this._paintGeneration && this.isVisible());
+			if (generation !== this._paintGeneration || !this.isVisible()) {
+				return;
+			}
+			if (this._regexScanner.failed) {
+				this._warnRegexTimeout();
+				registry.clear(this);
+				this._updateCodeDecorations(new Map());
+				return;
+			}
 			if (!locatedMatch) {
 				continue;
 			}
@@ -834,6 +949,7 @@ export class ChatFindWidget extends SimpleFindWidget implements IChatFindControl
 	}
 
 	private _clearHighlights(): void {
+		this._paintGeneration++;
 		getChatFindHighlightRegistry(this._targetWindow).clear(this);
 		this._updateCodeDecorations(new Map());
 	}
